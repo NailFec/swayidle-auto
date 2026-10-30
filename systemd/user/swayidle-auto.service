@@ -1,0 +1,13 @@
+[Unit]
+Description=Do not lock or sleep on AC power or a desktop
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/swayidle-auto
+Restart=on-failure
+RestartSec=2s
+
+[Install]
+WantedBy=graphical-session.target

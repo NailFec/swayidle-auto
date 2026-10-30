@@ -1,0 +1,137 @@
+#!/bin/bash
+# Idle policy for a Wayland session.
+#
+# UPower OnBattery is false when a laptop is on AC (charging, full, or held
+# at a charge limit) and when the machine has no system battery. Mice and
+# other peripheral batteries do not count, so a desktop stays in this state.
+# Then this script does not lock and does not sleep.
+#
+# On battery: hyprlock after LOCK_SEC, suspend after SUSPEND_SEC.
+# A manual lock shortcut is left alone.
+
+LOCK_SEC=300
+SUSPEND_SEC=600
+
+export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/bin:${HOME}/.local/bin${PATH:+:$PATH}"
+
+SELF=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/$(basename -- "$0")
+RUNTIME="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+
+on_battery() {
+    local v
+    v=$(busctl get-property org.freedesktop.UPower /org/freedesktop/UPower org.freedesktop.UPower OnBattery 2>/dev/null) || return 1
+    [ "$v" = "b true" ]
+}
+
+lock_screen() {
+    local -a extra=()
+    [ "${1:-}" = immediate ] && extra=(--immediate-render)
+    pidof hyprlock >/dev/null 2>&1 && return 0
+    nohup hyprlock "${extra[@]}" >/dev/null 2>&1 &
+}
+
+case "${1:-}" in
+lock)
+    on_battery || exit 0
+    lock_screen
+    exit 0
+    ;;
+suspend)
+    on_battery || exit 0
+    exec systemctl suspend
+    ;;
+before-sleep)
+    on_battery || exit 0
+    lock_screen immediate
+    # swayidle -w waits for this command. Return once hyprlock has the session
+    # so suspend is not held until unlock.
+    sleep 1
+    exit 0
+    ;;
+esac
+
+mkdir -p "$RUNTIME"
+exec 9>"$RUNTIME/swayidle-auto.lock"
+flock -n 9 || exit 0
+
+SWAYIDLE=$(command -v swayidle || true)
+inhibit_pid=
+swayidle_pid=
+mode=
+
+stop_pid() {
+    local pid=${1:-}
+    [ -n "$pid" ] || return 0
+    kill "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+}
+
+stop_inhibit() {
+    stop_pid "${inhibit_pid:-}"
+    inhibit_pid=
+}
+
+stop_swayidle() {
+    stop_pid "${swayidle_pid:-}"
+    swayidle_pid=
+}
+
+cleanup() {
+    stop_swayidle
+    stop_inhibit
+}
+trap cleanup EXIT INT TERM
+
+start_inhibit() {
+    if [ -n "${inhibit_pid:-}" ] && kill -0 "$inhibit_pid" 2>/dev/null; then
+        return 0
+    fi
+    systemd-inhibit \
+        --what=idle:sleep \
+        --who="swayidle-auto" \
+        --why="Plugged in or no system battery: do not lock or sleep" \
+        --mode=block \
+        sleep infinity &
+    inhibit_pid=$!
+}
+
+start_swayidle() {
+    if [ -z "$SWAYIDLE" ]; then
+        echo "swayidle-auto: on battery, but swayidle is not installed" >&2
+        return 1
+    fi
+    # -w: wait until before-sleep returns before logind suspends.
+    "$SWAYIDLE" -w \
+        timeout "$LOCK_SEC" "$SELF lock" \
+        timeout "$SUSPEND_SEC" "$SELF suspend" \
+        before-sleep "$SELF before-sleep" &
+    swayidle_pid=$!
+}
+
+apply() {
+    if on_battery; then
+        stop_inhibit
+        if [ "$mode" = battery ] && [ -n "${swayidle_pid:-}" ] && kill -0 "$swayidle_pid" 2>/dev/null; then
+            return 0
+        fi
+        stop_swayidle
+        if start_swayidle; then
+            [ "$mode" = battery ] || echo "swayidle-auto: on battery, lock after ${LOCK_SEC}s, suspend after ${SUSPEND_SEC}s"
+        fi
+        mode=battery
+    else
+        # Block sleep before stopping swayidle, so an in-flight suspend is refused.
+        start_inhibit
+        stop_swayidle
+        if [ "$mode" != awake ]; then
+            echo "swayidle-auto: plugged in or no system battery, lock and sleep disabled"
+            mode=awake
+        fi
+    fi
+    printf '%s\n' "$mode" >"$RUNTIME/swayidle-auto.mode"
+}
+
+while true; do
+    apply
+    sleep 2
+done
